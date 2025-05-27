@@ -1,0 +1,147 @@
+import serial
+import json
+import re
+import asyncio
+import threading
+import queue
+import tkinter as tk
+from tkinter import ttk, messagebox as msgbox
+from bleak import BleakScanner
+
+# BLE + Serial Settings
+PORT = "COM4"
+BAUDRATE = 9600
+
+# Message queues
+inbox_messages = queue.Queue()
+spam_messages = queue.Queue()
+blocked_messages = queue.Queue()
+
+# Filters
+block_id = ["scam@fraud.com"]
+block_domain = ["phishmail.org", "spam.net"]
+trusted_ids = ["abc@gmail.com", "support@yahoo.com"]
+trusted_domains = ["gmail.com", "yahoo.com"]
+suspicious_keywords = ["urgent", "click here", "password"]
+important_keywords = ["bank", "otp", "transaction"]
+
+# === Backend BLE and Serial Handling ===
+def get_domain(sender):
+    match = re.search(r"@([\w.-]+)", sender)
+    return match.group(1) if match else ""
+
+def is_spam(sender, subject, content):
+    reasons = []
+    if sender not in trusted_ids:
+        reasons.append("Untrusted sender")
+    if get_domain(sender) not in trusted_domains:
+        reasons.append("Suspicious domain")
+    if any(word in subject or word in content for word in suspicious_keywords):
+        reasons.append("Suspicious keyword")
+    return reasons
+
+def extract_fields(msg):
+    try:
+        data = json.loads(msg)
+        return data.get("sender", ""), data.get("subject", ""), data.get("content", "")
+    except:
+        parts = [x.strip() for x in msg.split(",", 2)]
+        if len(parts) == 3:
+            return parts[0], parts[1], parts[2]
+    return "<unknown>", "<unknown>", msg
+
+async def scan_ble():
+    print("Scanning BLE devices...")
+    devices = await BleakScanner.discover(timeout=5)
+    for i, d in enumerate(devices):
+        print(f"{i+1}. {d.name} ({d.address})")
+    return devices[0] if devices else None
+
+def serial_reader():
+    try:
+        with serial.Serial(PORT, BAUDRATE, timeout=1) as bt:
+            while True:
+                if bt.in_waiting:
+                    raw = bt.readline().decode("utf-8").strip()
+                    if not raw:
+                        continue
+                    sender, subject, content = extract_fields(raw)
+                    domain = get_domain(sender)
+
+                    if sender in block_id or domain in block_domain:
+                        blocked_messages.put((sender, subject, content))
+                        continue
+
+                    reasons = is_spam(sender, subject.lower(), content.lower())
+                    if reasons:
+                        spam_messages.put((sender, subject, content, reasons))
+                    else:
+                        inbox_messages.put((sender, subject, content))
+    except serial.SerialException:
+        print("❌ Serial port error")
+
+def start_backend():
+    threading.Thread(target=lambda: asyncio.run(scan_ble()), daemon=True).start()
+    threading.Thread(target=serial_reader, daemon=True).start()
+
+# === Frontend GUI ===
+class SpamDetectorGUI:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Bluetooth Spam Detector")
+        self.root.geometry("700x400")
+
+        # Layout
+        self.sidebar = tk.Frame(root, bg="#ddd", width=150)
+        self.sidebar.pack(side="left", fill="y")
+
+        self.message_area = tk.Text(root, wrap="word", font=("Arial", 11))
+        self.message_area.pack(fill="both", expand=True)
+
+        self.create_buttons()
+
+        # Periodically update UI
+        self.root.after(1000, self.update_messages)
+
+    def create_buttons(self):
+        tk.Button(self.sidebar, text="INBOX", width=18, command=self.display_inbox).pack(pady=10)
+        tk.Button(self.sidebar, text="SPAM", width=18, command=self.display_spam).pack(pady=10)
+        tk.Button(self.sidebar, text="BLOCK LIST", width=18, command=self.display_blocked).pack(pady=10)
+
+    def update_messages(self):
+        # auto-refresh new messages
+        self.root.after(2000, self.update_messages)
+
+    def display_inbox(self):
+        self.message_area.delete(1.0, tk.END)
+        inbox_copy = list(inbox_messages.queue)
+        if not inbox_copy:
+            self.message_area.insert(tk.END, "📭 Inbox is empty.\n")
+        for sender, subject, content in inbox_copy:
+            self.message_area.insert(tk.END, f"From: {sender}\nSubject: {subject}\nContent: {content}\n\n")
+
+    def display_spam(self):
+        self.message_area.delete(1.0, tk.END)
+        spam_copy = list(spam_messages.queue)
+        if not spam_copy:
+            self.message_area.insert(tk.END, "✅ No spam detected.\n")
+        for sender, subject, content, reasons in spam_copy:
+            self.message_area.insert(tk.END, f"From: {sender}\nSubject: {subject}\nContent: {content}\n")
+            for reason in reasons:
+                self.message_area.insert(tk.END, f"⚠️ {reason}\n")
+            self.message_area.insert(tk.END, "\n")
+
+    def display_blocked(self):
+        self.message_area.delete(1.0, tk.END)
+        blocked_copy = list(blocked_messages.queue)
+        if not blocked_copy:
+            self.message_area.insert(tk.END, "🛑 No blocked messages.\n")
+        for sender, subject, content in blocked_copy:
+            self.message_area.insert(tk.END, f"From: {sender}\nSubject: {subject}\nContent: {content}\n\n")
+
+# === Start Everything ===
+if __name__ == "__main__":
+    start_backend()
+    root = tk.Tk()
+    app = SpamDetectorGUI(root)
+    root.mainloop()
